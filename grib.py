@@ -503,17 +503,20 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
        available, as-is (forecast_hour 0) -- the default whenever the
        caller hasn't asked for a specific time.
     4. date given: treated as the desired *valid* time, not necessarily a
-       run's own init time -- if it's still in the future (e.g. "local
-       noon" requested before noon has actually happened), there's no run
-       initialized then, so the freshest run actually posted is used
-       instead, with whatever forecast lead lands on the requested valid
-       time, rather than silently falling back to an earlier analysis and
-       mislabeling it. If it's now or in the past, the run at/before it is
-       used directly (forecast_hour 0), stepping back an hour at a time if
-       that exact hour isn't posted (or is older than the archive's
-       start) -- this is the one case that steps back at all, since
-       pinning either the run or the lead explicitly (1-2) means stepping
-       would silently change what was asked for.
+       run's own init time. In the future (e.g. "local noon" requested
+       before noon has happened) no run is initialized then, so the
+       freshest posted run is used at whatever lead reaches that time; at
+       or in the past, the run at that hour is used as its own analysis
+       (lead 0).
+
+       Either way the requested valid time is what's held fixed. Where no
+       run supports it -- the hour has no run of its own (these models
+       post 3-hourly off their synoptic cycles), or the freshest run
+       can't reach far enough -- the run steps back an hour at a time and
+       the lead *grows* to match, so the answer stays at the time asked
+       for and only gets older. Cases 1-2 pin the run or lead explicitly
+       and so never step: there, stepping would silently change what was
+       asked for.
 
     The assembled GRIB2 subset (all requested messages for one run, on
     the order of 80 MB) is cached under CACHE_DIR the same way Wyoming
@@ -563,6 +566,17 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
             run_date = valid_time
             forecast_hour = 0
             allow_retry = True
+            # Same treatment for a past valid time, and for the same
+            # reason. These models don't run every hour -- RRFS posts
+            # 3-hourly off its synoptic cycles (09/12/15/18Z present,
+            # 10/11/13/14/16/17Z absent; verified against the bucket) --
+            # so an analysis often doesn't exist at the hour asked for.
+            # Stepping the run back at a fixed lead 0 silently answers a
+            # different time than the one requested: 17Z walked back to
+            # the 15Z analysis, two hours early, when 15Z f02 lands on
+            # 17Z exactly. Holding the valid time and growing the lead
+            # gets the hour that was actually asked for.
+            hold_valid_time = valid_time
 
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
