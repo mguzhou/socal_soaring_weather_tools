@@ -3,3 +3,12 @@ __pycache__/
 *.pyc
 *.png
 *.svg
+
+# Generated data. sites.tsv is input, not output, so it stays tracked.
+*.tsv
+!sites.tsv
+
+# Virtualenv, and third-party checkouts that aren't part of this project.
+.venv/
+siphon/
+HRRR_Jupyter/

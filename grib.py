@@ -56,7 +56,19 @@ from config import CACHE_DIR
 # point in that situation would need the separate 2m/10m diagnostic
 # fields (a different product/level string, plus the surface pressure
 # value itself to know what pressure to plot them at) -- not pursued.
-MODEL_PRESSURE_LEVELS = list(range(1000, 399, -25))
+# Every isobaric level the model publishes, rather than a fixed list:
+# matched as a pattern so each model contributes whatever it has (RRFS
+# reaches 2 mb, HRRR 50 mb; both step 25 mb up to 400 and coarsen above).
+# The profile used to stop at 400 mb, which was enough for thermals but
+# cut off high cloud entirely, and left mpcalc.el() with no crossing to
+# find on unstable days -- a convective equilibrium level sits nearer
+# 200-300 mb. Measured cost of going from 1000-400 to everything: RRFS
+# 125 -> 225 messages, 203 -> 320 MB; HRRR 125 -> 195, 88 -> 131 MB.
+ISOBARIC_SEARCH = r':(?:HGT|TMP|DPT|UGRD|VGRD):\d+ mb:'
+# Lower bound for the sanity check on how many messages the index
+# returned -- the 1000-400 mb band alone is 125, so anything near that
+# means the index is intact; the exact count now varies by model.
+MIN_ISOBARIC_MESSAGES = 110
 HRRR_FETCH_WORKERS = 16
 
 
@@ -219,13 +231,11 @@ SURFACE_PRODUCT = {'hrrr': 'sfc', 'rrfs': '2d'}
 # _fetch_native_levels, which already treats "not found" as "skip these,
 # isobaric-only is all there is").
 NATIVE_LEVEL_PRODUCT = {'hrrr': 'nat', 'rrfs': 'natlev'}
-# How many of the near-surface native levels to pull -- level 15 was
-# ~3.5 km/667 mb in testing (HRRR, San Diego area), comfortably covering
-# the boundary-layer depth these plots actually care about (6 km MSL
-# cap), while levels 1-6 alone already pack into the same range the 25 mb
-# isobaric spacing only samples 2-3 times -- 2-3x the near-surface
-# resolution without pulling all 50 levels up into the stratosphere.
-MAX_NATIVE_LEVEL = 15
+# How many native levels to pull. All 50 of them: the lowest 15 reach
+# only ~3.5 km/667 mb, which covers the boundary layer but stops well
+# below the high cloud these are now also being used to see. Costs 90 ->
+# 300 messages, 139 -> 393 MB per run for HRRR.
+MAX_NATIVE_LEVEL = 50
 
 # (model, run, lead) triples already found to publish no native levels,
 # so the same negative network probe isn't repeated for every point looked
@@ -584,8 +594,7 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
                           pool_maxsize=HRRR_FETCH_WORKERS, max_retries=retry)
     session.mount('https://', adapter)
 
-    wanted_levels = '|'.join(str(lvl) for lvl in MODEL_PRESSURE_LEVELS)
-    search = rf':(?:HGT|TMP|DPT|UGRD|VGRD):(?:{wanted_levels}) mb:'
+    search = ISOBARIC_SEARCH
 
     grib_path = None
     for _ in range(max_tries if (allow_retry or hold_valid_time is not None) else 1):
@@ -611,8 +620,9 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
         url = h.grib
 
         inventory = h.inventory(search=search)
-        if len(inventory) < len(MODEL_PRESSURE_LEVELS) * 5 * 0.9:
-            raise RuntimeError(f'{model.upper()} index missing expected messages for {run_date}')
+        if len(inventory) < MIN_ISOBARIC_MESSAGES:
+            raise RuntimeError(f'{model.upper()} index missing expected messages for {run_date} '
+                               f'({len(inventory)} < {MIN_ISOBARIC_MESSAGES})')
 
         def _fetch_one(row):
             start = int(row.start_byte)
