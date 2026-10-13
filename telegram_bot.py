@@ -10,6 +10,10 @@ Usage (in a chat with the bot):
     /site Little Black 14           -> ... at 2pm today
     /site Little Black 2026-09-17T12 -> ... at that time
 
+    /pointforecast Little Black     -> today's daylight hours, as tables
+    /pointforecast Little Black 17  -> ... the 17th's
+    /pointforecast Little Black sat -> ... Saturday's
+
 Times are local (SOUNDING_TIMEZONE, default America/Los_Angeles) unless
 they say otherwise -- "2026-09-17T19Z" or "21Z" are UTC.
 
@@ -33,15 +37,18 @@ import logging
 import os
 import re
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dateutil import parser as dateutil_parser
-from telegram import BotCommand, Update
+from telegram import BotCommand, InputMediaPhoto, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+import forecast_table
 import grib
+import point_forecast
 import Simple_Sounding
 from replay import ReplayIndex
 from wyoming import latest_synoptic_time
@@ -279,6 +286,97 @@ async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _render_and_reply(update, argv, timeout=600, label=name)
 
 
+def _render_point_forecast(name, lat, lon, day, progress):
+    """Blocking: fetch one day's point forecast and draw its tables.
+    Returns (forecast, [thermals PNG, wind PNG]).
+
+    Under the render lock although nothing here touches pyplot: it shares
+    the download cache with /site, and two cold fetches at once would
+    only halve each other's bandwidth."""
+    with _render_lock:
+        try:
+            result = point_forecast.forecast(lat, lon, day, progress=progress)
+        finally:
+            _release_freed_memory()
+        return result, forecast_table.render_tables(result, LOCAL_TZ, name=name,
+                                                    output_dir=OUTPUT_DIR)
+
+
+async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            'Usage: /pointforecast <name> [day]\nSee /sites for the list of names.')
+        return
+
+    match, remaining = match_site(args)
+    if match is None:
+        await update.message.reply_text(
+            f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
+        return
+    name, lat, lon = match
+
+    now = datetime.now(LOCAL_TZ)
+    if remaining:
+        try:
+            day = point_forecast.parse_day(' '.join(remaining), now.date())
+        except ValueError:
+            await update.message.reply_text(
+                f'Bad day {" ".join(remaining)!r}: try 17, sat, tomorrow or 2026-10-17.')
+            return
+    else:
+        # No day means the next daylight there is: today, until the sun
+        # has set on it.
+        day = now.date()
+        sun = point_forecast.sun_times(lat, lon, day)
+        if sun is not None and now > sun[1]:
+            day += timedelta(days=1)
+
+    label = f'{name} point forecast for {day:%a %b} {day.day}'
+    status = await update.message.reply_text(f'Fetching {label}...')
+
+    # A cold day is a dozen hours of GRIB2 and takes minutes, so the
+    # status message counts them off. Called from the worker thread;
+    # edits are spaced out to stay clear of Telegram's flood limit.
+    loop = asyncio.get_running_loop()
+    last_edit, shown = time.monotonic(), 0
+
+    def progress(done, total):
+        nonlocal last_edit, shown
+        # The total grows if the day's thermals need a second, deeper
+        # fetch; the count shown never goes back down for it.
+        percent = 100 * done // total
+        if shown < percent < 100 and time.monotonic() - last_edit >= 5:
+            last_edit, shown = time.monotonic(), percent
+            asyncio.run_coroutine_threadsafe(
+                status.edit_text(f'Fetching {label}... {percent}%'), loop)
+
+    try:
+        result, paths = await asyncio.wait_for(
+            asyncio.to_thread(_render_point_forecast, name, lat, lon, day, progress), 1800)
+    except asyncio.TimeoutError:
+        await update.message.reply_text('Timed out fetching that forecast.')
+        return
+    except point_forecast.Unavailable as e:
+        await update.message.reply_text(str(e))
+        return
+    except Exception as e:
+        logger.exception('Point forecast failed')
+        await update.message.reply_text(f'Failed: {type(e).__name__}: {e}')
+        return
+
+    newest = result.runs[-1].astimezone(LOCAL_TZ)
+    caption = (f'{name}, {day:%a %b} {day.day} \N{EM DASH} {result.source.label}, '
+               f'run {newest:%a %H:%M %Z}')
+    media = [InputMediaPhoto(path.read_bytes(), caption=caption if i == 0 else None)
+             for i, path in enumerate(paths)]
+    await update.message.reply_media_group(media)
+    # The tables replace the progress counter, which would otherwise sit
+    # above them stopped short of 100%.
+    with contextlib.suppress(Exception):
+        await status.delete()
+
+
 async def list_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sites = load_sites()
     if not sites:
@@ -298,6 +396,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         BotCommand('sounding', 'Observed radiosonde: /sounding [station] [local time]'),
         BotCommand('site', 'Modeled sounding at a site, now: /site <name> [local time]'),
+        BotCommand('pointforecast', 'Hourly lift, wind and cloud tables: /pointforecast <name> [day]'),
         BotCommand('sites', 'List named sites (from sites.tsv)'),
     ])
 
@@ -310,6 +409,7 @@ def main() -> None:
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler('sounding', sounding))
     app.add_handler(CommandHandler('site', site))
+    app.add_handler(CommandHandler('pointforecast', pointforecast))
     app.add_handler(CommandHandler('sites', list_sites))
     logger.info('Bot starting (polling)...')
     app.run_polling()

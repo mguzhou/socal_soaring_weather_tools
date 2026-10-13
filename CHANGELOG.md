@@ -107,6 +107,23 @@ been split into modules.
 - Runs as a systemd user service (`weather-sounding-bot.service`) with
   the token in a mode-600 `EnvironmentFile`.
 
+## Point forecast
+
+- `point_forecast.py` / `forecast_table.py`, and `/pointforecast <site>
+  [day]` in the bot: every daylight hour of one day as two tables of
+  altitude (250 ft steps) against hour — thermals (top of lift, cumulus
+  base, cloud cover, updraft at altitude) and wind.
+- Same models, run selection and parcel construction as a modeled
+  sounding, so the two agree hour for hour; the updraft is `w*` from the
+  model's surface heat flux, shaped by Lenschow's profile.
+- Fetches far less than twelve soundings would: only the levels above
+  the ground and as deep as the day's thermals need, RH instead of
+  dewpoint, and each message reduced to one grid point as it is read.
+- GFS for this comes off NOAA's GRIB2 bucket, not THREDDS — hourly
+  rather than 3-hourly, with its averaged heat flux un-averaged.
+- A run counts as posted only once both its files *and their `.idx`* are
+  up: a run mid-upload has the GRIB2 before the index.
+
 ## Also found along the way
 
 - 1000 mb is the highest isobaric level either model publishes; there is

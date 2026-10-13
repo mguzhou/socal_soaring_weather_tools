@@ -71,6 +71,8 @@ Four cases, checked in order:
 | `geocode.py` | Station code or lat/lon → place name for the title |
 | `cli.py` | Argument parsing |
 | `config.py` | Shared constants (cache dir, model priority, units) |
+| `point_forecast.py` | A site's whole day: per-hour fetch, thermal top, updraft, wind |
+| `forecast_table.py` | The point forecast's two tables, drawn |
 | `telegram_bot.py` | Telegram front end |
 
 The two source modules are named for their *access mechanism*, not their
@@ -136,6 +138,71 @@ message's own metadata. eccodes reports longitudes in 0-360, so lookups
 normalise to that convention — querying with a raw -180..180 value
 silently matches somewhere thousands of km away.
 
+## Point forecast
+
+```bash
+$PY point_forecast.py --lat 32.988 --lon -117.122 --name "Little Black"
+$PY point_forecast.py --lat 32.988 --lon -117.122 --date sat --model hrrr
+```
+
+One site, one local day, every hour the sun is up, as two tables of
+altitude (every 250 ft MSL) against hour — `PF_<MODEL>_<lat>_<lon>_<day>_run<run>_thermals.png`
+and `…_wind.png`:
+
+- **Thermals** — top of lift, cumulus base (or "blue"), the model's low /
+  middle / high cloud cover, and the expected updraft at each altitude.
+- **Wind** — direction and speed at each altitude, the surface wind and
+  gust, with each hour's top of lift ruled across its column.
+
+`--date` takes a date, a bare day of the month (`17`), a weekday, `today`
+or `tomorrow`.
+
+It reads the same models, in the same priority order, as a modeled
+sounding, and each hour's run and lead are chosen by the same rule — so
+a column agrees with the sounding for that hour. Checked on one RRFS
+hour against the sounding's own profile: same grid point, identical
+heights, temperatures and winds, dewpoint within 0.1 °C (it comes from RH
+here), top of lift within 15 ft. HRRR will differ a little more, since a
+sounding also merges in its native levels and this doesn't fetch them.
+
+One model serves the whole day: the first in the chain that reaches
+every hour, GFS being the only one past ~3.5 days. Past f120 GFS is
+3-hourly, so a day that far out has a column every third hour.
+
+**Top of lift and cumulus base** are the sounding's own construction (the
+"Thermal tops" / "Cloud base" line): a parcel with the 2 m temperature and
+the mixed layer's mean moisture, followed up to where it meets the
+environment, or to its condensation level if that comes first.
+
+**Updraft** is the convective velocity scale `w* = (g/T · H/ρcp · zi)^⅓`
+— the model's surface sensible heat flux `H` mixed through the depth of
+lift `zi` — spread over height with Lenschow & Stephens' profile
+`(z/zi)^⅓ (1 − 1.1 z/zi)`, scaled so the strongest level reads `w*`. It
+is the air in a thermal core; a glider climbs at that less its own sink.
+
+**Cloud cover** is the model's own layer diagnostics, not inferred from
+the profile.
+
+### What it fetches
+
+A sounding pulls every isobaric level of one hour and decodes the whole
+grid. Twelve of those would be 2–4 GB, so this fetches narrowly instead:
+
+- surface diagnostics first, then only the isobaric levels above the
+  ground, to 250 hPa over it — the rest, up to 500 mb, only on a day
+  whose thermals come within 50 hPa of that;
+- RH in place of dewpoint (same information, a half to a third of the
+  bytes), and only through the mixed layer the parcel's moisture comes
+  from;
+- each message reduced to its one grid point as it is read, so nothing
+  the size of the grid is held or written back out.
+
+That comes to roughly 45 MB an hour for HRRR at a low site, 85 MB for
+RRFS, 35 MB for GFS. GFS is read from NOAA's GRIB2 bucket here rather
+than through THREDDS: hourly files to f120 instead of a 3-hourly series,
+and its heat flux — published only as a mean since the run's last
+6-hourly reset — can be un-averaged against the previous lead.
+
 ## Cache
 
 Everything lands in `cache/` (git-ignored):
@@ -148,6 +215,8 @@ Everything lands in `cache/` (git-ignored):
 | `<...>.native.grib2` | Native levels |
 | `<...>.surface.grib2` | 2 m / 10 m / surface-pressure fields |
 | `<MODEL>_terrain.npz` | Orography — static, so cached once per model rather than per run |
+| `<MODEL>_<run>_f<lead>.point.grib2` | Point-forecast messages for that hour; appended to as other sites ask for other levels |
+| `<...>.point.json` | What that file holds, in order |
 
 Fetches write to a `.part` file and rename on completion, so an
 interrupted run can't leave a truncated file that looks complete. The
@@ -160,6 +229,9 @@ cache is keyed by run, never by point, so it only grows with new runs.
 /site <name> [time]            e.g. /site Little Black            (this hour)
                                     /site Little Black 14         (2pm today)
                                     /site Little Black 2026-09-17T12
+/pointforecast <name> [day]    e.g. /pointforecast Little Black     (today)
+                                    /pointforecast Little Black 17  (the 17th)
+                                    /pointforecast Little Black sat
 /sites                         list the named sites
 ```
 
@@ -171,6 +243,15 @@ work too. The command line keeps reading bare times as UTC.
 `/site` with no time is a forecast for the current hour from the freshest
 model run. (It used to be that run's own analysis, which for RRFS —
 3-hourly, posted ~1.5 h late — can be up to ~4 h old.)
+
+`/pointforecast` replies with the two [point forecast](#point-forecast)
+tables as an album. A bare number is a **day of the month** here, not an
+hour — the tables already cover every daylight hour — and no day means
+today, or tomorrow once the sun has set. A cold day is several hundred MB
+of GRIB2, so the "Fetching…" message counts up as it goes; a second site
+on the same runs reuses whatever messages are already down. It isn't
+replayed from `replay-index/` the way soundings are: a repeat re-reads the
+cached GRIB2, which takes seconds.
 
 Named sites come from `../sites.tsv`: one tab-separated `name`, `lat`,
 `lon` per line. The parser splits on `\s+` rather than on tabs
@@ -269,6 +350,10 @@ and on Linux, loading it alongside pyproj's copies crashes
   for recent runs; worth checking before a long historical study.
 - **GFS can't pin a run or lead** — its "Best" series doesn't expose
   cycles.
+- **A point forecast's ground is the model's.** Altitudes are MSL, but the
+  surface row and the depth of lift start from the grid cell's terrain,
+  which a 3 km model smooths and a 0.25° one flattens: a ridge-top launch
+  can sit well above it.
 - **1000 mb is the floor**, so a sounding at a below-sea-level or
   very-high-pressure site has no isobaric level beneath that. The surface
   row now covers the bottom regardless.
