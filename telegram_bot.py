@@ -3,11 +3,19 @@
 Usage (in a chat with the bot):
     /sounding                      -> latest NKX sounding
     /sounding 72572                -> latest sounding for station 72572
-    /sounding NKX 2025-01-01T12    -> that station's sounding at that run
+    /sounding NKX 2025-07-01T17    -> that station's 00Z launch (5pm PDT)
 
     /sites                          -> list named sites (from sites.tsv)
-    /site Little Black              -> latest modeled sounding at that site
-    /site Little Black 2026-09-17T19 -> that site's sounding at that time
+    /site Little Black              -> modeled sounding at that site, this hour
+    /site Little Black 14           -> ... at 2pm today
+    /site Little Black 2026-09-17T12 -> ... at that time
+
+    /pointforecast Little Black     -> today's daylight hours, as tables
+    /pointforecast Little Black 17  -> ... the 17th's
+    /pointforecast Little Black sat -> ... Saturday's
+
+Times are local (SOUNDING_TIMEZONE, default America/Los_Angeles) unless
+they say otherwise -- "2026-09-17T19Z" or "21Z" are UTC.
 
 Setup:
     export TELEGRAM_BOT_TOKEN="<token from @BotFather>"
@@ -29,13 +37,21 @@ import logging
 import os
 import re
 import threading
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from telegram import BotCommand, Update
+from dateutil import parser as dateutil_parser
+from telegram import BotCommand, InputMediaPhoto, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+import forecast_table
 import grib
+import point_forecast
 import Simple_Sounding
+from replay import ReplayIndex
+from wyoming import latest_synoptic_time
 
 logging.basicConfig(level=logging.INFO)
 # httpx logs every request at INFO, and the Telegram API puts the bot
@@ -51,6 +67,13 @@ SCRIPT_DIR = Path(__file__).parent
 SITES_FILE = Path(os.environ.get('SOUNDING_SITES_FILE') or SCRIPT_DIR.parent / 'sites.tsv')
 OUTPUT_DIR = Path(os.environ.get('SOUNDING_OUTPUT_DIR') or SCRIPT_DIR)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Earlier renders, re-sent while still current instead of fetched and
+# drawn again -- see replay.py.
+REPLAY = ReplayIndex(OUTPUT_DIR / 'replay-index')
+# The zone times typed into chat are read in. The command line keeps
+# reading bare times as UTC (cli.parse_datetime); people in a chat think
+# in local time, and "2pm" shouldn't need converting to 21Z first.
+LOCAL_TZ = ZoneInfo(os.environ.get('SOUNDING_TIMEZONE') or 'America/Los_Angeles')
 
 # matplotlib's pyplot is global, mutable state, so two renders must never
 # overlap -- concurrent requests queue here instead. Rendering in-process
@@ -117,6 +140,27 @@ def match_site(args):
     return None, args
 
 
+def chat_datetime(text):
+    """A time typed into chat, as an ISO string with an explicit offset
+    for --datetime: read in LOCAL_TZ unless it names its own zone, with
+    missing fields taken from the current local hour. A bare hour ("14")
+    means that hour today, and "21Z" that hour in UTC -- dateutil alone
+    would read "14" as the 14th of the month. Anything unparseable is
+    passed through untouched, for argparse to reject with its usual
+    "Invalid date/time" message."""
+    now = datetime.now(LOCAL_TZ).replace(minute=0, second=0, microsecond=0)
+    m = re.fullmatch(r'(\d{1,2})([zZ]?)', text.strip())
+    if m and int(m.group(1)) < 24:
+        if m.group(2):
+            return now.astimezone(ZoneInfo('UTC')).replace(hour=int(m.group(1))).isoformat()
+        return now.replace(hour=int(m.group(1))).isoformat()
+    try:
+        dt = dateutil_parser.parse(text, default=now.replace(tzinfo=None))
+    except (ValueError, OverflowError):
+        return text
+    return (dt if dt.tzinfo else dt.replace(tzinfo=LOCAL_TZ)).isoformat()
+
+
 class BadArguments(Exception):
     """Arguments argparse refused, carrying its own complaint as text."""
 
@@ -143,15 +187,26 @@ def _render(argv: list) -> Path:
             # only the last part means anything to someone in a chat.
             message = complaint[-1].split('error: ', 1)[-1] if complaint else 'invalid arguments'
             raise BadArguments(message) from None
+        # "Latest" for an observed sounding means the latest synoptic
+        # launch, so pin that now: it's what this request is for, and it
+        # has to be part of the replay key or a 00Z render would be
+        # replayed for the 12Z launch.
+        if args.lat is None and args.datetime is None:
+            args.datetime = latest_synoptic_time()
+        replayed = REPLAY.lookup(args)
+        if replayed is not None:
+            logger.info('Replaying %s', replayed.name)
+            return replayed
         try:
-            stub = Simple_Sounding.main(args, output_dir=OUTPUT_DIR)
+            rendered = Simple_Sounding.render(args, output_dir=OUTPUT_DIR)
         finally:
             # The decoded-field memo pays off across sites in one batch;
             # here each request is usually a different run, so it would
             # just pin ~1 GB for the life of the service.
             grib.clear_field_cache()
             _release_freed_memory()
-    return Path(f'{stub}.png')
+        REPLAY.record(args, rendered)
+    return Path(f'{rendered.stub}.png')
 
 
 async def _render_and_reply(update: Update, argv: list, timeout: int, label: str) -> None:
@@ -185,10 +240,21 @@ async def _render_and_reply(update: Update, argv: list, timeout: int, label: str
 
 async def sounding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
+    # A named site is a flying site, not a radiosonde launch station: there
+    # is no observed sounding for it, so the Wyoming lookup below would only
+    # come back empty ("No recent sounding data") -- or, for a two-word name,
+    # read its second word as a bad datetime. Point at /site instead,
+    # keeping any datetime that was given.
+    match, remaining = match_site(args)
+    if match is not None:
+        suggestion = ' '.join(['/site', match[0], *remaining])
+        await update.message.reply_text(f'Command failed: Did you mean {suggestion}?')
+        return
+
     station = args[0] if len(args) >= 1 else 'NKX'
     argv = ['--station', station]
     if len(args) >= 2:
-        argv += ['--datetime', args[1]]
+        argv += ['--datetime', chat_datetime(args[1])]
 
     await _render_and_reply(update, argv, timeout=120, label=station)
 
@@ -207,15 +273,108 @@ async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     name, lat, lon = match
 
-    argv = ['--lat', str(lat), '--lon', str(lon), '--name', name]
-    if remaining:
-        argv += ['--datetime', ' '.join(remaining)]
+    # No time means this hour -- a forecast from the freshest run -- rather
+    # than the freshest run's own analysis, which for RRFS (3-hourly, posted
+    # ~1.5 h late) can be up to ~4 h old: 11am's at 2pm.
+    when = chat_datetime(' '.join(remaining)) if remaining else datetime.now(LOCAL_TZ).isoformat()
+    argv = ['--lat', str(lat), '--lon', str(lon), '--name', name, '--datetime', when]
 
     # A named site is a modeled (HRRR/RRFS/GFS) sounding, not the fast
     # Wyoming CSV archive /sounding uses -- a cold fetch (no cached GRIB2
     # run yet) can take several minutes, so this gets a much longer
     # timeout than /sounding's.
     await _render_and_reply(update, argv, timeout=600, label=name)
+
+
+def _render_point_forecast(name, lat, lon, day, progress):
+    """Blocking: fetch one day's point forecast and draw its tables.
+    Returns (forecast, [thermals PNG, wind PNG]).
+
+    Under the render lock although nothing here touches pyplot: it shares
+    the download cache with /site, and two cold fetches at once would
+    only halve each other's bandwidth."""
+    with _render_lock:
+        try:
+            result = point_forecast.forecast(lat, lon, day, progress=progress)
+        finally:
+            _release_freed_memory()
+        return result, forecast_table.render_tables(result, LOCAL_TZ, name=name,
+                                                    output_dir=OUTPUT_DIR)
+
+
+async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            'Usage: /pointforecast <name> [day]\nSee /sites for the list of names.')
+        return
+
+    match, remaining = match_site(args)
+    if match is None:
+        await update.message.reply_text(
+            f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
+        return
+    name, lat, lon = match
+
+    now = datetime.now(LOCAL_TZ)
+    if remaining:
+        try:
+            day = point_forecast.parse_day(' '.join(remaining), now.date())
+        except ValueError:
+            await update.message.reply_text(
+                f'Bad day {" ".join(remaining)!r}: try 17, sat, tomorrow or 2026-10-17.')
+            return
+    else:
+        # No day means the next daylight there is: today, until the sun
+        # has set on it.
+        day = now.date()
+        sun = point_forecast.sun_times(lat, lon, day)
+        if sun is not None and now > sun[1]:
+            day += timedelta(days=1)
+
+    label = f'{name} point forecast for {day:%a %b} {day.day}'
+    status = await update.message.reply_text(f'Fetching {label}...')
+
+    # A cold day is a dozen hours of GRIB2 and takes minutes, so the
+    # status message counts them off. Called from the worker thread;
+    # edits are spaced out to stay clear of Telegram's flood limit.
+    loop = asyncio.get_running_loop()
+    last_edit, shown = time.monotonic(), 0
+
+    def progress(done, total):
+        nonlocal last_edit, shown
+        # The total grows if the day's thermals need a second, deeper
+        # fetch; the count shown never goes back down for it.
+        percent = 100 * done // total
+        if shown < percent < 100 and time.monotonic() - last_edit >= 5:
+            last_edit, shown = time.monotonic(), percent
+            asyncio.run_coroutine_threadsafe(
+                status.edit_text(f'Fetching {label}... {percent}%'), loop)
+
+    try:
+        result, paths = await asyncio.wait_for(
+            asyncio.to_thread(_render_point_forecast, name, lat, lon, day, progress), 1800)
+    except asyncio.TimeoutError:
+        await update.message.reply_text('Timed out fetching that forecast.')
+        return
+    except point_forecast.Unavailable as e:
+        await update.message.reply_text(str(e))
+        return
+    except Exception as e:
+        logger.exception('Point forecast failed')
+        await update.message.reply_text(f'Failed: {type(e).__name__}: {e}')
+        return
+
+    newest = result.runs[-1].astimezone(LOCAL_TZ)
+    caption = (f'{name}, {day:%a %b} {day.day} \N{EM DASH} {result.source.label}, '
+               f'run {newest:%a %H:%M %Z}')
+    media = [InputMediaPhoto(path.read_bytes(), caption=caption if i == 0 else None)
+             for i, path in enumerate(paths)]
+    await update.message.reply_media_group(media)
+    # The tables replace the progress counter, which would otherwise sit
+    # above them stopped short of 100%.
+    with contextlib.suppress(Exception):
+        await status.delete()
 
 
 async def list_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -235,8 +394,9 @@ async def post_init(application: Application) -> None:
     # commands there may need "@YourBotUsername" if another bot in the
     # same group also defines the same command name).
     await application.bot.set_my_commands([
-        BotCommand('sounding', 'Skew-T sounding: /sounding [station] [datetime]'),
-        BotCommand('site', 'Named-site sounding: /site <name> [datetime]'),
+        BotCommand('sounding', 'Observed radiosonde: /sounding [station] [local time]'),
+        BotCommand('site', 'Modeled sounding at a site, now: /site <name> [local time]'),
+        BotCommand('pointforecast', 'Hourly lift, wind and cloud tables: /pointforecast <name> [day]'),
         BotCommand('sites', 'List named sites (from sites.tsv)'),
     ])
 
@@ -249,6 +409,7 @@ def main() -> None:
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler('sounding', sounding))
     app.add_handler(CommandHandler('site', site))
+    app.add_handler(CommandHandler('pointforecast', pointforecast))
     app.add_handler(CommandHandler('sites', list_sites))
     logger.info('Bot starting (polling)...')
     app.run_polling()
